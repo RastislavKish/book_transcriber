@@ -56,6 +56,7 @@ api_key = "..."
 [models."qwen-3.8-27b"]
 provider = "Cerebras"
 model_id = "qwen-3.8-27b"
+# max_completion_tokens = 25000   # cap on generated tokens per request (default: 25000)
 # reasoning_effort = "low"        # omit for none
 # input_price_per_mtok = 0.10     # optional, USD per 1M tokens, for cost reporting
 # output_price_per_mtok = 0.30

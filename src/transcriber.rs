@@ -82,6 +82,7 @@ impl Transcriber {
         let mut body = json!({
             "model": model.model.model_id,
             "messages": [ { "role": "user", "content": content } ],
+            "max_completion_tokens": model.model.max_completion_tokens,
         });
         if let Some(effort) = &model.model.reasoning_effort {
             body["reasoning_effort"] = json!(effort);

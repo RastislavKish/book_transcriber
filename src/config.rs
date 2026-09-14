@@ -34,11 +34,18 @@ pub struct ModelConfig {
     /// Optional reasoning effort ("low"/"medium"/"high"). Omit for none.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Upper bound on tokens the model may generate per request.
+    #[serde(default = "default_max_completion_tokens")]
+    pub max_completion_tokens: u32,
     /// Optional pricing, USD per 1M tokens, used only for cost reporting.
     #[serde(default)]
     pub input_price_per_mtok: Option<f64>,
     #[serde(default)]
     pub output_price_per_mtok: Option<f64>,
+}
+
+fn default_max_completion_tokens() -> u32 {
+    25_000
 }
 
 /// A model together with the provider it resolves to.
