@@ -125,7 +125,7 @@ fn run() -> Result<()> {
     std::fs::create_dir_all(&args.output)
         .with_context(|| format!("creating output directory {}", args.output.display()))?;
 
-    let prompt = load_prompt(&args.output)?;
+    let prompt = load_prompt(&args.output, config.default_prompt.as_deref())?;
 
     let model_name = args.model.as_deref().unwrap_or(&config.default_model);
     println!(
@@ -377,14 +377,16 @@ fn output_path_for(output_dir: &Path, image: &Path) -> PathBuf {
     output_dir.join(format!("{stem}.md"))
 }
 
-fn load_prompt(output_dir: &Path) -> Result<String> {
+/// Resolve the prompt: an output-directory `prompt` file overrides everything,
+/// then the config's `default_prompt`, then the built-in default.
+fn load_prompt(output_dir: &Path, config_default: Option<&str>) -> Result<String> {
     let prompt_file = output_dir.join("prompt");
     if prompt_file.exists() {
         let text = std::fs::read_to_string(&prompt_file)
             .with_context(|| format!("reading prompt file {}", prompt_file.display()))?;
         Ok(text.trim().to_string())
     } else {
-        Ok(DEFAULT_PROMPT.to_string())
+        Ok(config_default.unwrap_or(DEFAULT_PROMPT).to_string())
     }
 }
 

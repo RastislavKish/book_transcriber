@@ -10,6 +10,10 @@ use serde::Deserialize;
 pub struct Config {
     /// Name of the model (a key in `models`) used when `--model` is not given.
     pub default_model: String,
+    /// Prompt used when the output directory has no `prompt` file. Falls back
+    /// to a built-in default when unset.
+    #[serde(default)]
+    pub default_prompt: Option<String>,
     /// Providers keyed by name, e.g. `[providers.Cerebras]`.
     #[serde(default)]
     pub providers: HashMap<String, Provider>,

@@ -35,8 +35,8 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
   cleaned up on exit — so resume never re-renders already-done pages.
 - **Resume is on by default:** pages whose output already exists are skipped, so
   a re-run continues after an interruption. Use `--overwrite` to force.
-- If `<OUTPUT>/prompt` exists, its contents are used as the transcription prompt
-  instead of the built-in default.
+- The transcription prompt is resolved in order: an `<OUTPUT>/prompt` file if it
+  exists, else `default_prompt` from the config, else a built-in default.
 - With `--batch-size > 1`, the model is asked to separate pages with a marker;
   if it doesn't comply, the raw response is saved to `<a>-<b>.raw.md` (nothing is
   lost) and those pages should be re-run with a smaller batch.
@@ -58,6 +58,10 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
 
 ```toml
 default_model = "qwen-3.8-27b"
+
+# Used when the output directory has no `prompt` file. Optional; omit for the
+# built-in default. A `prompt` file, when present, overrides this.
+# default_prompt = "Transcribe this page to clean Markdown. ..."
 
 [providers.Cerebras]
 base_url = "https://api.cerebras.ai/v1"   # OpenAI-compatible base; no trailing /chat/completions
