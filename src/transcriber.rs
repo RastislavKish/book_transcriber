@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
@@ -13,6 +13,36 @@ use crate::config::ResolvedModel;
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+}
+
+/// How to retry requests that fail with a transient error (network problems,
+/// rate limits, provider overload, 5xx).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Number of retries after the initial attempt.
+    pub max_retries: u32,
+    /// Base delay for exponential backoff.
+    pub base_delay: Duration,
+    /// Upper bound on any single backoff wait.
+    pub max_delay: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            base_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+/// A failed attempt, tagged with whether it is worth retrying and any
+/// server-provided `Retry-After` hint.
+struct Attempt {
+    retryable: bool,
+    message: String,
+    retry_after: Option<Duration>,
 }
 
 pub struct Transcriber {
@@ -29,13 +59,16 @@ impl Transcriber {
     }
 
     /// Send `prompt` plus every image to the model and return the raw text
-    /// response together with the reported token usage.
+    /// response together with the reported token usage. Transient failures are
+    /// retried with exponential backoff per `retry`.
     pub fn transcribe(
         &self,
         model: &ResolvedModel<'_>,
         prompt: &str,
         images: &[&Path],
+        retry: RetryConfig,
     ) -> Result<(String, Usage)> {
+        // Build the request body once; only the network call is retried.
         let mut content: Vec<Value> = Vec::with_capacity(images.len() + 1);
         content.push(json!({ "type": "text", "text": prompt }));
         for path in images {
@@ -59,31 +92,99 @@ impl Transcriber {
             model.provider.base_url.trim_end_matches('/')
         );
 
-        let response = self
+        let mut attempt: u32 = 0;
+        loop {
+            match self.try_once(&url, &model.provider.api_key, &body) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    if !err.retryable || attempt >= retry.max_retries {
+                        bail!("{}", err.message);
+                    }
+                    let delay = err
+                        .retry_after
+                        .map(|d| d.min(Duration::from_secs(300)))
+                        .unwrap_or_else(|| backoff(attempt, &retry));
+                    eprintln!(
+                        "  attempt {} failed: {}; retrying in {:.1}s ({} left)",
+                        attempt + 1,
+                        err.message,
+                        delay.as_secs_f64(),
+                        retry.max_retries - attempt,
+                    );
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// One HTTP attempt. Errors carry a retryable flag so the caller can decide.
+    fn try_once(&self, url: &str, api_key: &str, body: &Value) -> Result<(String, Usage), Attempt> {
+        let response = match self
             .client
-            .post(&url)
-            .bearer_auth(&model.provider.api_key)
-            .json(&body)
+            .post(url)
+            .bearer_auth(api_key)
+            .json(body)
             .send()
-            .with_context(|| format!("sending request to {url}"))?;
+        {
+            Ok(r) => r,
+            // Connection/timeout/DNS failures are transient; retry them.
+            Err(e) => {
+                return Err(Attempt {
+                    retryable: true,
+                    message: format!("sending request to {url}: {e}"),
+                    retry_after: None,
+                });
+            }
+        };
 
         let status = response.status();
-        let text = response.text().context("reading response body")?;
+        let retry_after = parse_retry_after(&response);
+        let text = response.text().unwrap_or_default();
+
         if !status.is_success() {
-            bail!("provider returned {status}: {text}");
+            // Retry on rate limiting (429), request timeout (408), the
+            // Anthropic-style overload (529), and any 5xx. Other 4xx (bad
+            // request, auth, not found) are terminal.
+            let code = status.as_u16();
+            let retryable = matches!(code, 408 | 429 | 529) || status.is_server_error();
+            return Err(Attempt {
+                retryable,
+                message: format!("provider returned {status}: {}", truncate(&text, 500)),
+                retry_after,
+            });
         }
 
-        let value: Value =
-            serde_json::from_str(&text).context("parsing response body as JSON")?;
+        let value: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Attempt {
+                    retryable: false,
+                    message: format!("parsing response body as JSON: {e}"),
+                    retry_after: None,
+                });
+            }
+        };
 
-        let message = value
+        let message = match value
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-            .ok_or_else(|| anyhow!("response did not contain choices[0].message.content: {text}"))?
-            .to_string();
+        {
+            Some(m) => m.to_string(),
+            None => {
+                return Err(Attempt {
+                    retryable: false,
+                    message: format!(
+                        "response did not contain choices[0].message.content: {}",
+                        truncate(&text, 500)
+                    ),
+                    retry_after: None,
+                });
+            }
+        };
 
         let usage = Usage {
             prompt_tokens: value
@@ -97,6 +198,49 @@ impl Transcriber {
         };
 
         Ok((clean_output(&message), usage))
+    }
+}
+
+/// Exponential backoff with full jitter: a random wait in
+/// `[0, min(max_delay, base * 2^attempt)]`.
+fn backoff(attempt: u32, retry: &RetryConfig) -> Duration {
+    let cap = retry.max_delay.as_secs_f64();
+    let exp = retry.base_delay.as_secs_f64() * 2f64.powi(attempt as i32);
+    let ceiling = exp.min(cap);
+    Duration::from_secs_f64(ceiling * jitter_fraction())
+}
+
+/// A pseudo-random fraction in `[0, 1)`, derived from the clock to avoid a
+/// dependency on a random-number crate.
+fn jitter_fraction() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1_000_000) as f64 / 1_000_000.0
+}
+
+/// Parse a `Retry-After` header expressed in seconds.
+fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
     }
 }
 

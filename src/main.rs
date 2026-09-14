@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use std::time::Duration;
+
 use config::Config;
-use transcriber::{Transcriber, Usage};
+use transcriber::{RetryConfig, Transcriber, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
 const PAGE_BREAK: &str = "<<<--- PAGE BREAK --->>>";
@@ -55,6 +57,11 @@ struct Args {
     /// (resume/skip is on by default).
     #[arg(long)]
     overwrite: bool,
+
+    /// Retries per request on transient errors (rate limits, overload, 5xx,
+    /// network failures) before giving up. Uses exponential backoff.
+    #[arg(long, default_value_t = 5)]
+    max_retries: u32,
 }
 
 fn main() {
@@ -142,6 +149,11 @@ fn run() -> Result<()> {
     }
 
     let transcriber = Transcriber::new()?;
+    let retry = RetryConfig {
+        max_retries: args.max_retries,
+        base_delay: Duration::from_secs(2),
+        max_delay: Duration::from_secs(60),
+    };
     let mut total = Usage::default();
 
     for batch in pending.chunks(args.batch_size) {
@@ -152,7 +164,7 @@ fn run() -> Result<()> {
         println!("Transcribing {label} ...");
 
         let (text, usage) = transcriber
-            .transcribe(&model, &batch_prompt, &paths)
+            .transcribe(&model, &batch_prompt, &paths, retry)
             .with_context(|| format!("transcribing {label}"))?;
         total.prompt_tokens += usage.prompt_tokens;
         total.completion_tokens += usage.completion_tokens;
