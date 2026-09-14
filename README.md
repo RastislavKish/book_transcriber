@@ -18,6 +18,7 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
       --config <PATH>    config file (default: ~/.config/book_transcriber/config.toml)
       --overwrite        re-transcribe pages even if their .md already exists
       --max-retries <N>  retries per request on transient errors (default: 5)
+  -j, --jobs <N>         requests to run in parallel (default: 4)
 ```
 
 - Each image is written to `<OUTPUT>/<stem>.md` (e.g. `12.png` → `12.md`).
@@ -29,6 +30,11 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
 - With `--batch-size > 1`, the model is asked to separate pages with a marker;
   if it doesn't comply, the raw response is saved to `<a>-<b>.raw.md` (nothing is
   lost) and those pages should be re-run with a smaller batch.
+- Requests run concurrently (`--jobs`, default 4); each batch is one request.
+  Completion order is not deterministic, but every page is written to its own
+  file. If one batch exhausts its retries the others still finish; the failed
+  pages are listed at the end and the run exits non-zero — re-running picks them
+  up (done pages are skipped). Lower `--jobs` if you hit provider rate limits.
 - Transient failures — rate limits (429), overload (429/529), 5xx, and network
   errors — are retried with exponential backoff (full jitter), honoring a
   `Retry-After` header when present. Terminal errors (400/401/404, …) fail

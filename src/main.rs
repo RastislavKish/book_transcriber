@@ -3,6 +3,9 @@ mod transcriber;
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::thread;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -62,6 +65,10 @@ struct Args {
     /// network failures) before giving up. Uses exponential backoff.
     #[arg(long, default_value_t = 5)]
     max_retries: u32,
+
+    /// Number of requests to run in parallel.
+    #[arg(short, long, default_value_t = 4)]
+    jobs: usize,
 }
 
 fn main() {
@@ -154,25 +161,77 @@ fn run() -> Result<()> {
         base_delay: Duration::from_secs(2),
         max_delay: Duration::from_secs(60),
     };
-    let mut total = Usage::default();
 
-    for batch in pending.chunks(args.batch_size) {
-        let paths: Vec<&Path> = batch.iter().map(|p| p.image.as_path()).collect();
-        let batch_prompt = build_prompt(&prompt, batch.len());
-
-        let label = batch_label(batch);
-        println!("Transcribing {label} ...");
-
-        let (text, usage) = transcriber
-            .transcribe(&model, &batch_prompt, &paths, retry)
-            .with_context(|| format!("transcribing {label}"))?;
-        total.prompt_tokens += usage.prompt_tokens;
-        total.completion_tokens += usage.completion_tokens;
-
-        write_batch(batch, &text, &args.output)?;
+    let batches: Vec<&[Page]> = pending.chunks(args.batch_size).collect();
+    let total_batches = batches.len();
+    let workers = args.jobs.max(1).min(total_batches);
+    if workers > 1 {
+        println!("Running {workers} requests in parallel.");
     }
 
+    // Shared state for the worker pool.
+    let next = AtomicUsize::new(0); // index of the next batch to claim
+    let done = AtomicUsize::new(0); // completed batches, for progress display
+    let prompt_tokens = AtomicU64::new(0);
+    let completion_tokens = AtomicU64::new(0);
+    let output = Mutex::new(()); // serializes multi-line console output
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if idx >= total_batches {
+                        break;
+                    }
+                    let batch = batches[idx];
+                    let paths: Vec<&Path> = batch.iter().map(|p| p.image.as_path()).collect();
+                    let batch_prompt = build_prompt(&prompt, batch.len());
+                    let label = batch_label(batch);
+
+                    match transcriber.transcribe(&model, &batch_prompt, &paths, retry) {
+                        Ok((text, usage)) => {
+                            prompt_tokens.fetch_add(usage.prompt_tokens, AtomicOrdering::Relaxed);
+                            completion_tokens
+                                .fetch_add(usage.completion_tokens, AtomicOrdering::Relaxed);
+                            let summary = write_batch(batch, &text, &args.output);
+                            let n = done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                            let _lock = output.lock().unwrap();
+                            match summary {
+                                Ok(s) => println!("[{n}/{total_batches}] {label}: {s}"),
+                                Err(e) => {
+                                    eprintln!("[{n}/{total_batches}] {label}: write failed: {e:#}");
+                                    failures.lock().unwrap().push(format!("{label}: {e:#}"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _lock = output.lock().unwrap();
+                            eprintln!("{label}: failed: {e:#}");
+                            failures.lock().unwrap().push(format!("{label}: {e:#}"));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let total = Usage {
+        prompt_tokens: prompt_tokens.into_inner(),
+        completion_tokens: completion_tokens.into_inner(),
+    };
     report_usage(&total, &model);
+
+    let failures = failures.into_inner().unwrap();
+    if !failures.is_empty() {
+        eprintln!("\n{} batch(es) failed:", failures.len());
+        for f in &failures {
+            eprintln!("  {f}");
+        }
+        eprintln!("Re-run to retry the failed pages (already-done pages are skipped).");
+        bail!("{} batch(es) failed", failures.len());
+    }
     Ok(())
 }
 
@@ -247,18 +306,21 @@ fn batch_label(batch: &[Page]) -> String {
     }
 }
 
-/// Split a batch response on the page-break marker and write each page.
-fn write_batch(batch: &[Page], text: &str, output_dir: &Path) -> Result<()> {
+/// Split a batch response on the page-break marker, write each page, and
+/// return a short human-readable summary of what was written.
+fn write_batch(batch: &[Page], text: &str, output_dir: &Path) -> Result<String> {
     if batch.len() == 1 {
         write_page(&batch[0], text)?;
-        return Ok(());
+        return Ok(format!("wrote {}", file_name(&batch[0].output)));
     }
 
     let parts: Vec<&str> = text.split(PAGE_BREAK).map(str::trim).collect();
     if parts.len() == batch.len() {
-        for (page, part) in batch.iter().zip(parts) {
+        for (page, part) in batch.iter().zip(&parts) {
             write_page(page, part)?;
         }
+        let names: Vec<String> = batch.iter().map(|p| file_name(&p.output)).collect();
+        Ok(format!("wrote {}", names.join(", ")))
     } else {
         // The model didn't delimit as asked. Don't guess a split and risk
         // misaligning pages: dump the raw response so nothing is lost.
@@ -268,23 +330,20 @@ fn write_batch(batch: &[Page], text: &str, output_dir: &Path) -> Result<()> {
             stem(&batch[batch.len() - 1].image)
         );
         let raw = output_dir.join(&name);
-        std::fs::write(&raw, text)
-            .with_context(|| format!("writing {}", raw.display()))?;
-        eprintln!(
-            "warning: expected {} pages but got {} sections; wrote raw response to {} \
+        std::fs::write(&raw, text).with_context(|| format!("writing {}", raw.display()))?;
+        Ok(format!(
+            "expected {} pages but got {} sections; wrote raw response to {} \
 (re-run these pages with a smaller --batch-size)",
             batch.len(),
             parts.len(),
-            raw.display()
-        );
+            name
+        ))
     }
-    Ok(())
 }
 
 fn write_page(page: &Page, text: &str) -> Result<()> {
     std::fs::write(&page.output, text)
         .with_context(|| format!("writing {}", page.output.display()))?;
-    println!("  wrote {}", page.output.display());
     Ok(())
 }
 
