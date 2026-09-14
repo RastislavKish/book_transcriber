@@ -6,10 +6,11 @@ Markdown plain text using a vision-capable LLM over an OpenAI-compatible API.
 ## Usage
 
 ```
-book_transcriber <INPUT> <OUTPUT> [OPTIONS]
+book_transcriber <INPUT> [OUTPUT] [OPTIONS]
 
   <INPUT>   a directory of page images (.png / .jpg / .jpeg), or a .pdf file
-  <OUTPUT>  directory for the resulting Markdown files
+  <OUTPUT>  optional. A directory -> one Markdown file per page. Omitted ->
+            a single combined file named after the input (see below)
 
   -b, --batch-size <N>   images per request (default: 1)
   -s, --start <N>        1-indexed page (position in sorted list) to start at
@@ -33,18 +34,33 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
   `--dpi` (default 200; below ~150 hurts OCR quality on body text). Only the
   pages actually being transcribed are rendered, and to a temp directory that is
   cleaned up on exit — so resume never re-renders already-done pages.
-- **Resume is on by default:** pages whose output already exists are skipped, so
-  a re-run continues after an interruption. Use `--overwrite` to force.
-- The transcription prompt is resolved in order: an `<OUTPUT>/prompt` file if it
-  exists, else `default_prompt` from the config, else a built-in default.
+### Output: per-page directory or single combined file
+
+- **Give an output directory** → one Markdown file per page. Image pages keep
+  their stem (`12.png` → `<OUTPUT>/12.md`); PDF pages are named by page number
+  (`<OUTPUT>/3.md`). **Resume is on by default:** pages whose file already exists
+  are skipped, so a re-run continues after an interruption (`--overwrite` forces
+  a redo). This mode also supports a `prompt` file (see below).
+- **Omit the output** → all pages are combined into a single file named after
+  the input, written next to it (`document.pdf` → `document.md`, directory
+  `mybook/` → `mybook.md`). Pages are assembled in order regardless of when each
+  request finishes; a failed page leaves a visible `<!-- page N: transcription
+  failed -->` placeholder rather than a silent gap. There's no per-page resume
+  here — re-running requires `--overwrite`.
+
+### Other behavior
+
+- The transcription prompt is resolved in order: a `prompt` file in the output
+  directory (per-page mode only), else `default_prompt` from the config, else a
+  built-in default.
 - With `--batch-size > 1`, the model is asked to separate pages with a marker;
-  if it doesn't comply, the raw response is saved to `<a>-<b>.raw.md` (nothing is
-  lost) and those pages should be re-run with a smaller batch.
+  if it doesn't comply, the pages aren't split (per-page mode saves the raw
+  response to `<a>-<b>.raw.md`; single-file mode keeps it as one block). Re-run
+  those with `--batch-size 1`.
 - Requests run concurrently (`--jobs`, default 4); each batch is one request.
-  Completion order is not deterministic, but every page is written to its own
-  file. If one batch exhausts its retries the others still finish; the failed
-  pages are listed at the end and the run exits non-zero — re-running picks them
-  up (done pages are skipped). Lower `--jobs` if you hit provider rate limits.
+  If one batch exhausts its retries the others still finish; the failed pages are
+  listed at the end and the run exits non-zero. In per-page mode, re-running
+  picks them up (done pages are skipped). Lower `--jobs` if you hit rate limits.
 - Transient failures — rate limits (429), overload (429/529), 5xx, and network
   errors — are retried with exponential backoff (full jitter), honoring a
   `Retry-After` header when present. Terminal errors (400/401/404, …) fail

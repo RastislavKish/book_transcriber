@@ -3,6 +3,7 @@ mod pdf;
 mod transcriber;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -34,9 +35,11 @@ struct Args {
     /// Input source: a directory of images (.png / .jpg / .jpeg) or a .pdf file.
     input: PathBuf,
 
-    /// Directory where the resulting Markdown files are written.
-    /// A file named `prompt` here, if present, is used as the user prompt.
-    output: PathBuf,
+    /// Output location. A directory writes one Markdown file per page (and a
+    /// `prompt` file there, if present, is used as the user prompt). If omitted,
+    /// all pages are combined into a single file named after the input
+    /// (e.g. `document.pdf` -> `document.md`), written next to it.
+    output: Option<PathBuf>,
 
     /// How many images to send to the model in a single request.
     #[arg(short, long, default_value_t = 1)]
@@ -122,10 +125,33 @@ fn run() -> Result<()> {
     let config = Config::load(&config_path)?;
     let model = config.resolve(args.model.as_deref())?;
 
-    std::fs::create_dir_all(&args.output)
-        .with_context(|| format!("creating output directory {}", args.output.display()))?;
+    // Directory output => one file per page; no output => a single combined file
+    // named after the input.
+    let output = match &args.output {
+        Some(dir) => Output::PerPage(dir.clone()),
+        None => Output::Single(combined_output_path(&args.input)?),
+    };
+    match &output {
+        Output::PerPage(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating output directory {}", dir.display()))?;
+        }
+        Output::Single(path) => {
+            if path.exists() && !args.overwrite {
+                bail!(
+                    "output file {} already exists; pass --overwrite to replace it, \
+or give an output directory to write one file per page",
+                    path.display()
+                );
+            }
+        }
+    }
 
-    let prompt = load_prompt(&args.output, config.default_prompt.as_deref())?;
+    let prompt_dir = match &output {
+        Output::PerPage(dir) => Some(dir.as_path()),
+        Output::Single(_) => None,
+    };
+    let prompt = load_prompt(prompt_dir, config.default_prompt.as_deref())?;
 
     let model_name = args.model.as_deref().unwrap_or(&config.default_model);
     println!(
@@ -138,11 +164,11 @@ fn run() -> Result<()> {
     // finishes.
     let mut _tmp: Option<TempDir> = None;
     let pending = if is_pdf(&args.input) {
-        let (pages, tmp) = pdf_pages(&args)?;
+        let (pages, tmp) = pdf_pages(&args, &output)?;
         _tmp = Some(tmp);
         pages
     } else if args.input.is_dir() {
-        image_dir_pages(&args)?
+        image_dir_pages(&args, &output)?
     } else {
         bail!(
             "input {} is neither a .pdf file nor a directory",
@@ -174,8 +200,10 @@ fn run() -> Result<()> {
     let done = AtomicUsize::new(0); // completed batches, for progress display
     let prompt_tokens = AtomicU64::new(0);
     let completion_tokens = AtomicU64::new(0);
-    let output = Mutex::new(()); // serializes multi-line console output
+    let print_lock = Mutex::new(()); // serializes multi-line console output
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // Single-file mode buffers (order, text) here for ordered assembly.
+    let collected: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -195,9 +223,10 @@ fn run() -> Result<()> {
                             prompt_tokens.fetch_add(usage.prompt_tokens, AtomicOrdering::Relaxed);
                             completion_tokens
                                 .fetch_add(usage.completion_tokens, AtomicOrdering::Relaxed);
-                            let summary = write_batch(batch, &text, &args.output);
+                            let split = split_batch(batch, &text);
+                            let summary = deliver(&output, batch, split, &collected);
                             let n = done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                            let _lock = output.lock().unwrap();
+                            let _lock = print_lock.lock().unwrap();
                             match summary {
                                 Ok(s) => println!("[{n}/{total_batches}] {label}: {s}"),
                                 Err(e) => {
@@ -207,7 +236,7 @@ fn run() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            let _lock = output.lock().unwrap();
+                            let _lock = print_lock.lock().unwrap();
                             eprintln!("{label}: failed: {e:#}");
                             failures.lock().unwrap().push(format!("{label}: {e:#}"));
                         }
@@ -223,6 +252,11 @@ fn run() -> Result<()> {
     };
     report_usage(&total, &model);
 
+    // In single-file mode, assemble the collected pages in order and write once.
+    if let Output::Single(path) = &output {
+        write_combined(path, &pending, collected.into_inner().unwrap())?;
+    }
+
     let failures = failures.into_inner().unwrap();
     if !failures.is_empty() {
         eprintln!("\n{} batch(es) failed:", failures.len());
@@ -235,10 +269,24 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// One page: its source image and the Markdown file it maps to.
+/// Where transcriptions go.
+enum Output {
+    /// One Markdown file per page, written into this directory.
+    PerPage(PathBuf),
+    /// All pages combined into this single Markdown file.
+    Single(PathBuf),
+}
+
+/// One page to transcribe.
 struct Page {
+    /// Source image (an input file, or a rendered PDF page in a temp dir).
     image: PathBuf,
-    output: PathBuf,
+    /// Human-readable name for progress output (e.g. `12.png` or `page 3`).
+    label: String,
+    /// Position in the selected sequence; used to reassemble single-file output.
+    order: usize,
+    /// Destination file in per-page mode; `None` in single-file mode.
+    output: Option<PathBuf>,
 }
 
 fn file_name(path: &Path) -> String {
@@ -257,8 +305,22 @@ fn is_pdf(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// The destination file for one page in per-page mode, or `None` in single-file
+/// mode. Returns `None` via the `skip` flag when the file already exists and
+/// resume is active (per-page mode only).
+fn page_output(output: &Output, name: &str, overwrite: bool) -> (Option<PathBuf>, bool) {
+    match output {
+        Output::PerPage(dir) => {
+            let path = dir.join(format!("{name}.md"));
+            let skip = !overwrite && path.exists();
+            (Some(path), skip)
+        }
+        Output::Single(_) => (None, false),
+    }
+}
+
 /// Selected, not-yet-done pages from a directory of images (natural order).
-fn image_dir_pages(args: &Args) -> Result<Vec<Page>> {
+fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
     let mut images = list_images(&args.input)?;
     images.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
     if images.is_empty() {
@@ -280,14 +342,17 @@ fn image_dir_pages(args: &Args) -> Result<Vec<Page>> {
 
     let mut pending = Vec::new();
     let mut skipped = 0usize;
-    for img in &images[start_idx..end_idx] {
-        let out = output_path_for(&args.output, img);
-        if !args.overwrite && out.exists() {
+    for (order, img) in images[start_idx..end_idx].iter().enumerate() {
+        let stem = img.file_stem().and_then(|s| s.to_str()).unwrap_or("page");
+        let (out, skip) = page_output(output, stem, args.overwrite);
+        if skip {
             skipped += 1;
             continue;
         }
         pending.push(Page {
             image: img.clone(),
+            label: file_name(img),
+            order,
             output: out,
         });
     }
@@ -304,9 +369,9 @@ fn image_dir_pages(args: &Args) -> Result<Vec<Page>> {
 }
 
 /// Selected, not-yet-done pages from a PDF. Each pending page is rendered to a
-/// PNG in a temp directory (returned so it outlives transcription); output
-/// files are named by page number (e.g. `3.md`).
-fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
+/// PNG in a temp directory (returned so it outlives transcription); in per-page
+/// mode output files are named by page number (e.g. `3.md`).
+fn pdf_pages(args: &Args, output: &Output) -> Result<(Vec<Page>, TempDir)> {
     let doc = Pdf::open(&args.input)?;
     let total = doc.page_count()? as usize;
     if total == 0 {
@@ -332,18 +397,23 @@ fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
     let tmp = TempDir::new()?;
     let mut pending = Vec::new();
     let mut skipped = 0usize;
-    for page in (args.start)..=end {
+    for (order, page) in (args.start..=end).enumerate() {
         // `page` is the 1-based page number the user sees.
         let name = page.to_string();
-        let output = args.output.join(format!("{name}.md"));
-        if !args.overwrite && output.exists() {
+        let (out, skip) = page_output(output, &name, args.overwrite);
+        if skip {
             skipped += 1;
             continue;
         }
         let png = doc.render_page_png((page - 1) as i32, args.dpi)?;
         let image = tmp.path.join(format!("{name}.png"));
         std::fs::write(&image, png).with_context(|| format!("writing {}", image.display()))?;
-        pending.push(Page { image, output });
+        pending.push(Page {
+            image,
+            label: format!("page {page}"),
+            order,
+            output: out,
+        });
     }
 
     println!(
@@ -352,6 +422,17 @@ fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
         pending.len()
     );
     Ok((pending, tmp))
+}
+
+/// Derive the single-file output path from the input: `document.pdf` ->
+/// `document.md`, directory `mybook/` -> `mybook.md`, placed next to the input.
+fn combined_output_path(input: &Path) -> Result<PathBuf> {
+    let stem = match input.file_stem().and_then(|s| s.to_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => bail!("cannot derive an output file name from {}", input.display()),
+    };
+    let parent = input.parent().unwrap_or_else(|| Path::new(""));
+    Ok(parent.join(format!("{stem}.md")))
 }
 
 fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -372,22 +453,20 @@ fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn output_path_for(output_dir: &Path, image: &Path) -> PathBuf {
-    let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("page");
-    output_dir.join(format!("{stem}.md"))
-}
-
-/// Resolve the prompt: an output-directory `prompt` file overrides everything,
-/// then the config's `default_prompt`, then the built-in default.
-fn load_prompt(output_dir: &Path, config_default: Option<&str>) -> Result<String> {
-    let prompt_file = output_dir.join("prompt");
-    if prompt_file.exists() {
-        let text = std::fs::read_to_string(&prompt_file)
-            .with_context(|| format!("reading prompt file {}", prompt_file.display()))?;
-        Ok(text.trim().to_string())
-    } else {
-        Ok(config_default.unwrap_or(DEFAULT_PROMPT).to_string())
+/// Resolve the prompt: a `prompt` file in the per-page output directory
+/// overrides everything, then the config's `default_prompt`, then the built-in
+/// default. `prompt_dir` is `None` in single-file mode (no directory to hold a
+/// prompt file), so only the config/built-in defaults apply there.
+fn load_prompt(prompt_dir: Option<&Path>, config_default: Option<&str>) -> Result<String> {
+    if let Some(dir) = prompt_dir {
+        let prompt_file = dir.join("prompt");
+        if prompt_file.exists() {
+            let text = std::fs::read_to_string(&prompt_file)
+                .with_context(|| format!("reading prompt file {}", prompt_file.display()))?;
+            return Ok(text.trim().to_string());
+        }
     }
+    Ok(config_default.unwrap_or(DEFAULT_PROMPT).to_string())
 }
 
 /// Augment the base prompt with page-delimiter instructions for batches > 1.
@@ -406,56 +485,129 @@ the last one."
 
 fn batch_label(batch: &[Page]) -> String {
     match (batch.first(), batch.last()) {
-        (Some(first), _) if batch.len() == 1 => file_name(&first.image),
-        (Some(first), Some(last)) => {
-            format!("{}..{}", file_name(&first.image), file_name(&last.image))
-        }
+        (Some(first), _) if batch.len() == 1 => first.label.clone(),
+        (Some(first), Some(last)) => format!("{}..{}", first.label, last.label),
         _ => String::from("(empty)"),
     }
 }
 
-/// Split a batch response on the page-break marker, write each page, and
-/// return a short human-readable summary of what was written.
-fn write_batch(batch: &[Page], text: &str, output_dir: &Path) -> Result<String> {
-    if batch.len() == 1 {
-        write_page(&batch[0], text)?;
-        return Ok(format!("wrote {}", file_name(&batch[0].output)));
-    }
+/// The result of splitting a batch response into per-page text.
+enum BatchSplit<'a> {
+    /// One text section per page, aligned to the batch.
+    Pages(Vec<(&'a Page, String)>),
+    /// The model didn't delimit as asked; the whole response, unsplit.
+    Unsplit(String),
+}
 
+/// Split a batch response on the page-break marker. A single-image batch needs
+/// no marker; a multi-image batch whose section count doesn't match is returned
+/// unsplit rather than risking a misaligned guess.
+fn split_batch<'a>(batch: &'a [Page], text: &str) -> BatchSplit<'a> {
+    if batch.len() == 1 {
+        return BatchSplit::Pages(vec![(&batch[0], text.trim().to_string())]);
+    }
     let parts: Vec<&str> = text.split(PAGE_BREAK).map(str::trim).collect();
     if parts.len() == batch.len() {
-        for (page, part) in batch.iter().zip(&parts) {
-            write_page(page, part)?;
-        }
-        let names: Vec<String> = batch.iter().map(|p| file_name(&p.output)).collect();
-        Ok(format!("wrote {}", names.join(", ")))
+        BatchSplit::Pages(
+            batch
+                .iter()
+                .zip(parts)
+                .map(|(page, part)| (page, part.to_string()))
+                .collect(),
+        )
     } else {
-        // The model didn't delimit as asked. Don't guess a split and risk
-        // misaligning pages: dump the raw response so nothing is lost.
-        let name = format!(
-            "{}-{}.raw.md",
-            stem(&batch[0].image),
-            stem(&batch[batch.len() - 1].image)
-        );
-        let raw = output_dir.join(&name);
-        std::fs::write(&raw, text).with_context(|| format!("writing {}", raw.display()))?;
-        Ok(format!(
-            "expected {} pages but got {} sections; wrote raw response to {} \
-(re-run these pages with a smaller --batch-size)",
-            batch.len(),
-            parts.len(),
-            name
-        ))
+        BatchSplit::Unsplit(text.to_string())
     }
 }
 
-fn write_page(page: &Page, text: &str) -> Result<()> {
-    std::fs::write(&page.output, text)
-        .with_context(|| format!("writing {}", page.output.display()))?;
+/// Write (per-page mode) or buffer (single-file mode) the pages of one batch,
+/// returning a short human-readable summary.
+fn deliver(
+    output: &Output,
+    batch: &[Page],
+    split: BatchSplit,
+    collected: &Mutex<Vec<(usize, String)>>,
+) -> Result<String> {
+    match output {
+        Output::PerPage(dir) => match split {
+            BatchSplit::Pages(pairs) => {
+                let mut names = Vec::with_capacity(pairs.len());
+                for (page, text) in &pairs {
+                    let path = page.output.as_ref().expect("per-page mode has a path");
+                    std::fs::write(path, text)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    names.push(file_name(path));
+                }
+                Ok(format!("wrote {}", names.join(", ")))
+            }
+            BatchSplit::Unsplit(raw) => {
+                // Don't guess a split; dump the raw response so nothing is lost.
+                let name = format!(
+                    "{}-{}.raw.md",
+                    file_stem(&batch[0].image),
+                    file_stem(&batch[batch.len() - 1].image)
+                );
+                let path = dir.join(&name);
+                std::fs::write(&path, &raw)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                Ok(format!(
+                    "could not split {} pages; wrote raw response to {name} \
+(re-run these pages with --batch-size 1)",
+                    batch.len()
+                ))
+            }
+        },
+        Output::Single(_) => {
+            let mut buf = collected.lock().unwrap();
+            match split {
+                BatchSplit::Pages(pairs) => {
+                    let labels: Vec<&str> = pairs.iter().map(|(p, _)| p.label.as_str()).collect();
+                    let summary = format!("transcribed {}", labels.join(", "));
+                    for (page, text) in pairs {
+                        buf.push((page.order, text));
+                    }
+                    Ok(summary)
+                }
+                BatchSplit::Unsplit(raw) => {
+                    // Keep the whole response as one block at the batch's start.
+                    buf.push((batch[0].order, raw));
+                    Ok(format!(
+                        "could not split {} pages; kept as one block \
+(re-run with --batch-size 1)",
+                        batch.len()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Assemble the buffered single-file pages in page order and write the combined
+/// document. Pages that failed leave a visible placeholder rather than a silent
+/// gap.
+fn write_combined(path: &Path, pending: &[Page], collected: Vec<(usize, String)>) -> Result<()> {
+    let texts: HashMap<usize, String> = collected.into_iter().collect();
+    let mut sections = Vec::with_capacity(pending.len());
+    let mut missing = 0usize;
+    for page in pending {
+        match texts.get(&page.order) {
+            Some(text) => sections.push(text.clone()),
+            None => {
+                missing += 1;
+                sections.push(format!("<!-- {}: transcription failed -->", page.label));
+            }
+        }
+    }
+    let doc = sections.join("\n\n");
+    std::fs::write(path, &doc).with_context(|| format!("writing {}", path.display()))?;
+    println!("\nWrote {} ({} pages).", path.display(), pending.len());
+    if missing > 0 {
+        eprintln!("Note: {missing} page(s) failed and are marked with placeholders in the document.");
+    }
     Ok(())
 }
 
-fn stem(path: &Path) -> String {
+fn file_stem(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("page")
