@@ -305,7 +305,7 @@ fn image_dir_pages(args: &Args) -> Result<Vec<Page>> {
 
 /// Selected, not-yet-done pages from a PDF. Each pending page is rendered to a
 /// PNG in a temp directory (returned so it outlives transcription); output
-/// files are named by zero-padded page number (e.g. `003.md`).
+/// files are named by page number (e.g. `3.md`).
 fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
     let doc = Pdf::open(&args.input)?;
     let total = doc.page_count()? as usize;
@@ -324,8 +324,6 @@ fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
         Some(n) => (start_idx + n).min(total),
         None => total,
     };
-    let width = total.to_string().len();
-
     println!(
         "PDF: {total} pages; rendering pages {}..={end} at {:.0} DPI.",
         args.start, args.dpi
@@ -336,7 +334,7 @@ fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
     let mut skipped = 0usize;
     for page in (args.start)..=end {
         // `page` is the 1-based page number the user sees.
-        let name = format!("{page:0width$}");
+        let name = page.to_string();
         let output = args.output.join(format!("{name}.md"));
         if !args.overwrite && output.exists() {
             skipped += 1;

@@ -28,7 +28,7 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
   `<OUTPUT>/<stem>.md` (e.g. `12.png` → `12.md`), and files whose name begins
   with a number are sorted naturally (`2.png` before `10.png`).
 - **PDF:** pages are rendered to images in-process (via a bundled MuPDF) and
-  output is named by zero-padded page number (`<OUTPUT>/003.md`). `--start` and
+  output is named by page number (`<OUTPUT>/3.md`). `--start` and
   `--count` refer to PDF page numbers directly. Rendering resolution is set with
   `--dpi` (default 200; below ~150 hurts OCR quality on body text). Only the
   pages actually being transcribed are rendered, and to a temp directory that is
