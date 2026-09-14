@@ -1,4 +1,5 @@
 mod config;
+mod pdf;
 mod transcriber;
 
 use std::cmp::Ordering;
@@ -13,6 +14,7 @@ use clap::Parser;
 use std::time::Duration;
 
 use config::Config;
+use pdf::Pdf;
 use transcriber::{RetryConfig, Transcriber, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
@@ -29,7 +31,7 @@ and do not wrap your answer in a code fence. Output only the transcription.";
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Directory containing the input images (.png / .jpg / .jpeg).
+    /// Input source: a directory of images (.png / .jpg / .jpeg) or a .pdf file.
     input: PathBuf,
 
     /// Directory where the resulting Markdown files are written.
@@ -69,6 +71,31 @@ struct Args {
     /// Number of requests to run in parallel.
     #[arg(short, long, default_value_t = 4)]
     jobs: usize,
+
+    /// Resolution to render PDF pages at (PDF input only). Lower values hurt
+    /// OCR quality; ~200-300 is a good range.
+    #[arg(long, default_value_t = 200.0)]
+    dpi: f32,
+}
+
+/// A temporary directory removed when this guard is dropped.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("book_transcriber-{}", std::process::id()));
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("creating temp directory {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 fn main() {
@@ -100,56 +127,29 @@ fn run() -> Result<()> {
 
     let prompt = load_prompt(&args.output)?;
 
-    // Collect and naturally sort the input images.
-    let mut images = list_images(&args.input)?;
-    images.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
-    if images.is_empty() {
-        bail!("no .png/.jpg/.jpeg images found in {}", args.input.display());
-    }
-
-    // Apply --start / --count over the sorted list.
-    let start_idx = args.start - 1;
-    if start_idx >= images.len() {
-        bail!(
-            "--start {} is past the last page ({} images available)",
-            args.start,
-            images.len()
-        );
-    }
-    let end_idx = match args.count {
-        Some(n) => (start_idx + n).min(images.len()),
-        None => images.len(),
-    };
-    let selected = &images[start_idx..end_idx];
-
-    // Resolve output paths and, unless --overwrite, drop already-done pages.
-    let mut pending: Vec<Page> = Vec::new();
-    let mut skipped = 0usize;
-    for img in selected {
-        let out = output_path_for(&args.output, img);
-        if !args.overwrite && out.exists() {
-            skipped += 1;
-            continue;
-        }
-        pending.push(Page {
-            image: img.clone(),
-            output: out,
-        });
-    }
-
     let model_name = args.model.as_deref().unwrap_or(&config.default_model);
     println!(
         "Model: {model_name} ({} via {})",
         model.model.model_id, model.model.provider
     );
-    println!(
-        "Pages {}..={} of {} selected; {} to transcribe, {} already done.",
-        args.start,
-        end_idx,
-        images.len(),
-        pending.len(),
-        skipped
-    );
+
+    // Build the list of pages to transcribe from either a PDF or an image dir.
+    // For a PDF, rendered page images live in `_tmp`, kept alive until the run
+    // finishes.
+    let mut _tmp: Option<TempDir> = None;
+    let pending = if is_pdf(&args.input) {
+        let (pages, tmp) = pdf_pages(&args)?;
+        _tmp = Some(tmp);
+        pages
+    } else if args.input.is_dir() {
+        image_dir_pages(&args)?
+    } else {
+        bail!(
+            "input {} is neither a .pdf file nor a directory",
+            args.input.display()
+        );
+    };
+
     if pending.is_empty() {
         println!("Nothing to do.");
         return Ok(());
@@ -246,6 +246,114 @@ fn file_name(path: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_string()
+}
+
+fn is_pdf(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false)
+}
+
+/// Selected, not-yet-done pages from a directory of images (natural order).
+fn image_dir_pages(args: &Args) -> Result<Vec<Page>> {
+    let mut images = list_images(&args.input)?;
+    images.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
+    if images.is_empty() {
+        bail!("no .png/.jpg/.jpeg images found in {}", args.input.display());
+    }
+
+    let start_idx = args.start - 1;
+    if start_idx >= images.len() {
+        bail!(
+            "--start {} is past the last page ({} images available)",
+            args.start,
+            images.len()
+        );
+    }
+    let end_idx = match args.count {
+        Some(n) => (start_idx + n).min(images.len()),
+        None => images.len(),
+    };
+
+    let mut pending = Vec::new();
+    let mut skipped = 0usize;
+    for img in &images[start_idx..end_idx] {
+        let out = output_path_for(&args.output, img);
+        if !args.overwrite && out.exists() {
+            skipped += 1;
+            continue;
+        }
+        pending.push(Page {
+            image: img.clone(),
+            output: out,
+        });
+    }
+
+    println!(
+        "Pages {}..={} of {} selected; {} to transcribe, {} already done.",
+        args.start,
+        end_idx,
+        images.len(),
+        pending.len(),
+        skipped
+    );
+    Ok(pending)
+}
+
+/// Selected, not-yet-done pages from a PDF. Each pending page is rendered to a
+/// PNG in a temp directory (returned so it outlives transcription); output
+/// files are named by zero-padded page number (e.g. `003.md`).
+fn pdf_pages(args: &Args) -> Result<(Vec<Page>, TempDir)> {
+    let doc = Pdf::open(&args.input)?;
+    let total = doc.page_count()? as usize;
+    if total == 0 {
+        bail!("PDF {} has no pages", args.input.display());
+    }
+
+    let start_idx = args.start - 1;
+    if start_idx >= total {
+        bail!(
+            "--start {} is past the last page ({total} pages in the PDF)",
+            args.start
+        );
+    }
+    let end = match args.count {
+        Some(n) => (start_idx + n).min(total),
+        None => total,
+    };
+    let width = total.to_string().len();
+
+    println!(
+        "PDF: {total} pages; rendering pages {}..={end} at {:.0} DPI.",
+        args.start, args.dpi
+    );
+
+    let tmp = TempDir::new()?;
+    let mut pending = Vec::new();
+    let mut skipped = 0usize;
+    for page in (args.start)..=end {
+        // `page` is the 1-based page number the user sees.
+        let name = format!("{page:0width$}");
+        let output = args.output.join(format!("{name}.md"));
+        if !args.overwrite && output.exists() {
+            skipped += 1;
+            continue;
+        }
+        let png = doc.render_page_png((page - 1) as i32, args.dpi)?;
+        let image = tmp.path.join(format!("{name}.png"));
+        std::fs::write(&image, png).with_context(|| format!("writing {}", image.display()))?;
+        pending.push(Page { image, output });
+    }
+
+    println!(
+        "Pages {}..={end} selected; {} to transcribe, {skipped} already done.",
+        args.start,
+        pending.len()
+    );
+    Ok((pending, tmp))
 }
 
 fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {

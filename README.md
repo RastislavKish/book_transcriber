@@ -1,15 +1,15 @@
 # book_transcriber
 
-Transcribe a directory of scanned book pages (`.png` / `.jpg`) into Markdown
-plain text using a vision-capable LLM over an OpenAI-compatible API.
+Transcribe scanned book pages — a directory of images **or a PDF** — into
+Markdown plain text using a vision-capable LLM over an OpenAI-compatible API.
 
 ## Usage
 
 ```
 book_transcriber <INPUT> <OUTPUT> [OPTIONS]
 
-  <INPUT>   directory of page images (.png / .jpg / .jpeg)
-  <OUTPUT>  directory for the resulting <stem>.md files
+  <INPUT>   a directory of page images (.png / .jpg / .jpeg), or a .pdf file
+  <OUTPUT>  directory for the resulting Markdown files
 
   -b, --batch-size <N>   images per request (default: 1)
   -s, --start <N>        1-indexed page (position in sorted list) to start at
@@ -19,10 +19,20 @@ book_transcriber <INPUT> <OUTPUT> [OPTIONS]
       --overwrite        re-transcribe pages even if their .md already exists
       --max-retries <N>  retries per request on transient errors (default: 5)
   -j, --jobs <N>         requests to run in parallel (default: 4)
+      --dpi <N>          resolution to render PDF pages at (PDF only, default: 200)
 ```
 
-- Each image is written to `<OUTPUT>/<stem>.md` (e.g. `12.png` → `12.md`).
-- Files whose name begins with a number are sorted naturally (`2.png` before `10.png`).
+### Input: image directory or PDF
+
+- **Directory:** every `.png`/`.jpg`/`.jpeg` is a page. Output goes to
+  `<OUTPUT>/<stem>.md` (e.g. `12.png` → `12.md`), and files whose name begins
+  with a number are sorted naturally (`2.png` before `10.png`).
+- **PDF:** pages are rendered to images in-process (via a bundled MuPDF) and
+  output is named by zero-padded page number (`<OUTPUT>/003.md`). `--start` and
+  `--count` refer to PDF page numbers directly. Rendering resolution is set with
+  `--dpi` (default 200; below ~150 hurts OCR quality on body text). Only the
+  pages actually being transcribed are rendered, and to a temp directory that is
+  cleaned up on exit — so resume never re-renders already-done pages.
 - **Resume is on by default:** pages whose output already exists are skipped, so
   a re-run continues after an interruption. Use `--overwrite` to force.
 - If `<OUTPUT>/prompt` exists, its contents are used as the transcription prompt
