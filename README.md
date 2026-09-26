@@ -1,96 +1,91 @@
 # book_transcriber
 
-Transcribe scanned book pages — a directory of images **or a PDF** — into
-Markdown plain text using a vision-capable LLM over an OpenAI-compatible API.
+This is a simple program which lets me transcribe a PDF or a directory of PNG / JPG images using an arbitrary large language model. LLMs, including relatively small models often runnable on consumer hardware, have gotten pretty good at creating highly accurate transcriptions of even complex documents, where they can wastly outperform traditional solutions. The user can request the output to be processed in a specific way, meaning the LLM can handle page structure - headings, tables, transcribe math notation, describe diagrams, images and plots, and even understand spatially aligned structures, like the Pascal triangle.
+
+With this program, I'm trying to find out the best workflow for processing books with a screenreader, as well as determine the accuracy, strenghts and limitations of LLMs used for this purpose.
+
+## Disclaimer
+
+This project is 100% coded by Claude. I'm just lightly skimming through the output, but I'm not actively writing code nor steering the architectural decisions, because for the size of the project it's not worth it. The program is doing what I need it to do, and it's doing it really well, that's the important part for me. Anyone else is free to decide their priorities for themselves. As always, the project, by its license, does not come with any warranty, see the license text for more details.
 
 ## Usage
 
+### An example config file
+
+Since this is a project using large language models, you first need to configure the providers and models to be used. Create a config.toml in ~/.config/book_transcriber and give it the following content, replacing the services, models and instructions according to your needs:
+
 ```
-book_transcriber <INPUT> [OUTPUT] [OPTIONS]
+default_model="qwen-3.8-27b"
+default_prompt="Hello! Please transcribe these pages to Markdown. Use LaTeX for math expressions and replace any diagrams or images with placeholder alt descriptions, containing the relevant information for the particular image or diagram."
 
-  <INPUT>   a directory of page images (.png / .jpg / .jpeg), or a .pdf file
-  <OUTPUT>  optional. A directory -> one Markdown file per page. Omitted ->
-            a single combined file named after the input (see below)
-
-  -b, --batch-size <N>   images per request (default: 1)
-  -s, --start <N>        1-indexed page (position in sorted list) to start at
-  -n, --count <N>        number of pages to transcribe (default: all remaining)
-  -m, --model <NAME>     model to use (a key in [models]); overrides default_model
-      --config <PATH>    config file (default: ~/.config/book_transcriber/config.toml)
-      --overwrite        re-transcribe pages even if their .md already exists
-      --max-retries <N>  retries per request on transient errors (default: 5)
-  -j, --jobs <N>         requests to run in parallel (default: 4)
-      --dpi <N>          resolution to render PDF pages at (PDF only, default: 200)
-```
-
-### Input: image directory or PDF
-
-- **Directory:** every `.png`/`.jpg`/`.jpeg` is a page. Output goes to
-  `<OUTPUT>/<stem>.md` (e.g. `12.png` → `12.md`), and files whose name begins
-  with a number are sorted naturally (`2.png` before `10.png`).
-- **PDF:** pages are rendered to images in-process (via a bundled MuPDF) and
-  output is named by page number (`<OUTPUT>/3.md`). `--start` and
-  `--count` refer to PDF page numbers directly. Rendering resolution is set with
-  `--dpi` (default 200; below ~150 hurts OCR quality on body text). Only the
-  pages actually being transcribed are rendered, and to a temp directory that is
-  cleaned up on exit — so resume never re-renders already-done pages.
-### Output: per-page directory or single combined file
-
-- **Give an output directory** → one Markdown file per page. Image pages keep
-  their stem (`12.png` → `<OUTPUT>/12.md`); PDF pages are named by page number
-  (`<OUTPUT>/3.md`). **Resume is on by default:** pages whose file already exists
-  are skipped, so a re-run continues after an interruption (`--overwrite` forces
-  a redo). This mode also supports a `prompt` file (see below).
-- **Omit the output** → all pages are combined into a single file named after
-  the input, written next to it (`document.pdf` → `document.md`, directory
-  `mybook/` → `mybook.md`). Pages are assembled in order regardless of when each
-  request finishes; a failed page leaves a visible `<!-- page N: transcription
-  failed -->` placeholder rather than a silent gap. There's no per-page resume
-  here — re-running requires `--overwrite`.
-
-### Other behavior
-
-- The transcription prompt is resolved in order: a `prompt` file in the output
-  directory (per-page mode only), else `default_prompt` from the config, else a
-  built-in default.
-- With `--batch-size > 1`, the model is asked to separate pages with a marker;
-  if it doesn't comply, the pages aren't split (per-page mode saves the raw
-  response to `<a>-<b>.raw.md`; single-file mode keeps it as one block). Re-run
-  those with `--batch-size 1`.
-- Requests run concurrently (`--jobs`, default 4); each batch is one request.
-  If one batch exhausts its retries the others still finish; the failed pages are
-  listed at the end and the run exits non-zero. In per-page mode, re-running
-  picks them up (done pages are skipped). Lower `--jobs` if you hit rate limits.
-- Transient failures — rate limits (429), overload (429/529), 5xx, and network
-  errors — are retried with exponential backoff (full jitter), honoring a
-  `Retry-After` header when present. Terminal errors (400/401/404, …) fail
-  immediately. Tune with `--max-retries` (0 disables).
-- Token usage is reported at the end, with an estimated cost when per-model
-  pricing is set in the config.
-
-## Configuration
-
-`~/.config/book_transcriber/config.toml`:
-
-```toml
-default_model = "qwen-3.8-27b"
-
-# Used when the output directory has no `prompt` file. Optional; omit for the
-# built-in default. A `prompt` file, when present, overrides this.
-# default_prompt = "Transcribe this page to clean Markdown. ..."
+[providers]
 
 [providers.Cerebras]
-base_url = "https://api.cerebras.ai/v1"   # OpenAI-compatible base; no trailing /chat/completions
-api_key = "..."
+
+base_url="https://api.cerebras.ai/v1"
+api_key="..."
+
+[models]
 
 [models."qwen-3.8-27b"]
-provider = "Cerebras"
-model_id = "qwen-3.8-27b"
-# max_completion_tokens = 25000   # cap on generated tokens per request (default: 25000)
-# reasoning_effort = "low"        # omit for none
-# input_price_per_mtok = 0.10     # optional, USD per 1M tokens, for cost reporting
-# output_price_per_mtok = 0.30
+
+provider="Cerebras"
+model_id="qwen-3.8-27b"
 ```
 
-Add more `[providers.<Name>]` and `[models."<name>"]` tables as needed; pick one
-per run with `--model`.
+### Transcription
+
+I like to alias book_transcriber as btr:
+
+```sh
+btr book.pdf
+```
+
+Transcribes all pages in book.pdf, and puts them into a book.md file.
+
+```sh
+btr book.pdf, output_directory
+```
+
+Takes book.pdf and saves individual transcription pages into directory output_directory. Any already transcribed pages are skipped.
+
+```sh
+btr book_pages, output_directory
+```
+
+Reads images from directory book_pages and saves transcriptions into output_directory. If book_pages contains a plain-text file called prompt, this prompt is used for the transcription.
+
+```sh
+btr -s 120 -n 10 book.pdf output_directory
+```
+
+Transcribes 10 pages starting with page 120 and saves the result into output_directory.
+
+The program also offers other configurable parameters, for example, how many images are given to the model at once, or how many API requests are performed simultaneously. See ```btr --help``` for more information.
+
+## Build
+
+The project should be cross-platform, it uses portable dependencies including statically linked mupdf for rendering PDF files. On Linux, you need Rust and Clang to perform the compilation:
+
+```sh
+cargo build --release -q
+```
+
+The result will be placed in the target/release directory.
+
+## License
+
+Copyright (C) 2026 Rastislav Kish
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, version 3.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
